@@ -1,0 +1,20 @@
+name: pai-ros2-gazebo-v3
+services:
+  desktop:
+    image: pai-ros2-gazebo:v3
+    build:
+      context: .
+      dockerfile: docker/Dockerfile
+    ports:
+      - "127.0.0.1:6080:80"
+    shm_size: "1gb"
+    environment:
+      OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11435}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5vl:3b}
+      OLLAMA_TOKEN: ${OLLAMA_TOKEN:-}
+      ROS_DOMAIN_ID: "42"
+    volumes:
+      - ./src:/workspace/src
+      - ./tools:/workspace/tools:ro
+      - ./logs:/workspace/logs
+    stop_grace_period: 10s

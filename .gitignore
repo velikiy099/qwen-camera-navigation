@@ -1,0 +1,13 @@
+.env
+build/
+install/
+log/
+logs/*
+!logs/.gitkeep
+__pycache__/
+*.pyc
+.pytest_cache/
+*.egg-info/
+*.tar
+*.tar.gz
+.DS_Store

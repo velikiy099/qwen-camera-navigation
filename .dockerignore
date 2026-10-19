@@ -1,0 +1,12 @@
+.git
+.env
+logs
+**/__pycache__
+**/*.pyc
+**/*.egg-info
+**/build
+**/install
+**/log
+*.zip
+*.tar
+*.tar.gz

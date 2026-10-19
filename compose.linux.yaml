@@ -1,0 +1,5 @@
+# Linux Docker only. Docker Desktop for Mac already supplies this hostname.
+services:
+  desktop:
+    extra_hosts:
+      - "host.docker.internal:host-gateway"

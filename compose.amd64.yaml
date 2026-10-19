@@ -1,0 +1,4 @@
+# Opt-in fallback only; emulation can be substantially slower on Apple Silicon.
+services:
+  desktop:
+    platform: linux/amd64
