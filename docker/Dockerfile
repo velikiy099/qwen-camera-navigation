@@ -3,14 +3,14 @@
 FROM ros:humble-ros-base-jammy
 SHELL ["/bin/bash", "-o", "pipefail", "-c"]
 ENV DEBIAN_FRONTEND=noninteractive LANG=C.UTF-8 LC_ALL=C.UTF-8
-RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates gnupg lsb-release \
+RUN apt-get update && apt-get install -y --no-install-recommends curl ca-certificates \
     && curl -fsSL https://packages.osrfoundation.org/gazebo.gpg -o /usr/share/keyrings/pkgs-osrf-archive-keyring.gpg \
     && echo "deb [arch=$(dpkg --print-architecture) signed-by=/usr/share/keyrings/pkgs-osrf-archive-keyring.gpg] https://packages.osrfoundation.org/gazebo/ubuntu-stable jammy main" > /etc/apt/sources.list.d/gazebo-stable.list \
     && apt-get update && apt-get install -y --no-install-recommends \
-    ignition-fortress ros-humble-ros-gz ros-humble-rclpy ros-humble-std-msgs ros-humble-std-srvs \
-    ros-humble-sensor-msgs ros-humble-nav-msgs ros-humble-geometry-msgs ros-humble-rosgraph-msgs \
+    ignition-fortress ros-humble-ros-gz-bridge ros-humble-rclpy ros-humble-std-msgs ros-humble-std-srvs \
+    ros-humble-sensor-msgs ros-humble-geometry-msgs ros-humble-nav-msgs ros-humble-rosgraph-msgs \
     ros-humble-ros2launch ros-humble-launch-ros ros-humble-ament-index-python \
-    ros-humble-rqt-image-view ros-humble-rviz2 ros-humble-teleop-twist-keyboard \
+    ros-humble-rqt-image-view \
     python3-colcon-common-extensions python3-pytest python3-yaml python3-pil \
     xvfb x11vnc novnc websockify openbox xterm dbus-x11 x11-utils \
     mesa-utils libgl1-mesa-dri libglx-mesa0 fonts-dejavu-core procps tini \

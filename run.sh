@@ -8,7 +8,7 @@ init_env() {
         "$PY" - <<'PY'
 import os, secrets
 with open('.env', 'x') as f:
-    f.write('OLLAMA_URL=http://host.docker.internal:11435\nOLLAMA_MODEL=qwen2.5vl:3b\nOLLAMA_TOKEN=' + secrets.token_urlsafe(32) + '\n')
+    f.write('OLLAMA_URL=http://host.docker.internal:11435\nOLLAMA_MODEL=qwen3.5:4b-q8_0\nOLLAMA_TOKEN=' + secrets.token_urlsafe(32) + '\n')
 os.chmod('.env', 0o600)
 print('Created .env with a private local-proxy token. Do not upload this file.')
 PY
@@ -18,9 +18,10 @@ command_name="${1:-help}"
 if [ "$#" -gt 0 ]; then shift; fi
 case "$command_name" in
     help)
-        echo 'Usage: ./run.sh init|build|up|proxy|doctor|sim|mission|check|camera|halt|shell|test|record|down|rebuild'
+        echo 'Usage: ./run.sh init|build|up|proxy|doctor|sim|explore|mission|status|check|camera|halt|shell|test|record|down|rebuild'
         echo 'Example: ./run.sh mission "Find the red box"'
-        echo 'Example: ./run.sh sim controller:=false (for ./run.sh check --move)'
+        echo 'Example: ./run.sh status --watch (current mission progress and result)'
+        echo 'Example: ./run.sh check --vision (stationary camera-to-Qwen check)'
         exit 0 ;;
     init) init_env; exit 0 ;;
 esac
@@ -36,14 +37,16 @@ case "$command_name" in
     up) "${compose[@]}" up -d --no-build --pull never ;;
     doctor) ros_exec python3 /workspace/tools/doctor.py ;;
     sim) ros_exec ros2 launch pai_robot demo.launch.py "$@" ;;
+    explore) ros_exec ros2 launch pai_robot demo.launch.py world:=/workspace/src/pai_robot/worlds/hidden_search.sdf "$@" ;;
     mission) ros_exec ros2 run pai_robot mission "$@" ;;
+    status) ros_exec ros2 run pai_robot mission_status "$@" ;;
     check) ros_exec ros2 run pai_robot smoke_check "$@" ;;
     camera) ros_exec ros2 run rqt_image_view rqt_image_view /camera/image_raw ;;
     halt) ros_exec ros2 service call /halt std_srvs/srv/Trigger '{}' ;;
     shell) "${compose[@]}" exec desktop bash ;;
     test) ros_exec python3 -m unittest discover -s /workspace/src/pai_robot/test -v ;;
     rebuild) "${compose[@]}" exec desktop bash -c 'source /opt/ros/humble/setup.bash && cd /workspace && colcon build --symlink-install --packages-select pai_robot' ;;
-    record) ros_exec ros2 bag record -o "/workspace/logs/bag_$(date +%Y%m%d_%H%M%S)" /camera/image_raw /scan /odom /mission /cmd_vel_raw /cmd_vel /robot_state /clock ;;
+    record) ros_exec ros2 bag record -o "/workspace/logs/bag_$(date +%Y%m%d_%H%M%S)" /camera/image_raw /odom /mission /cmd_vel_raw /cmd_vel /robot_state /guard_state /clock ;;
     down) "${compose[@]}" down ;;
     *) echo "Unknown subcommand: $command_name" >&2; exit 2 ;;
 esac

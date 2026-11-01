@@ -10,7 +10,7 @@ services:
     shm_size: "1gb"
     environment:
       OLLAMA_URL: ${OLLAMA_URL:-http://host.docker.internal:11435}
-      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen2.5vl:3b}
+      OLLAMA_MODEL: ${OLLAMA_MODEL:-qwen3.5:4b-q8_0}
       OLLAMA_TOKEN: ${OLLAMA_TOKEN:-}
       ROS_DOMAIN_ID: "42"
     volumes:

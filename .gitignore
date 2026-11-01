@@ -1,4 +1,7 @@
 .env
+.env.*
+!.env.example
+.venv/
 build/
 install/
 log/
@@ -11,3 +14,16 @@ __pycache__/
 *.tar
 *.tar.gz
 .DS_Store
+/松尾研PhysicalAI応用1_2026
+
+# Local editing intermediates and generated media/upload records.
+/tmp/
+/output/*
+
+# Keep the editable report source and supporting assets; ignore generated PDFs.
+!/output/pdf/
+/output/pdf/**/*.pdf
+/output/pdf/node_modules/
+
+# Documentation and experiment artifacts stay local.
+/docs/

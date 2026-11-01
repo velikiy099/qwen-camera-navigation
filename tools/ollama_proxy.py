@@ -16,7 +16,7 @@ from urllib.parse import urlsplit
 
 MAX_BODY = 8 * 1024 * 1024
 
-def make_handler(token: str, backend='http://127.0.0.1:11434', model='qwen2.5vl:3b'):
+def make_handler(token: str, backend='http://127.0.0.1:11434', model='qwen3.5:4b-q8_0'):
     opener = build_opener(ProxyHandler({}))
     class Handler(BaseHTTPRequestHandler):
         server_version = 'PAILocalProxy/1'
@@ -75,7 +75,7 @@ def main():
         raise SystemExit('Missing/short OLLAMA_TOKEN. Start with ./run.sh proxy after ./run.sh init.')
     bind = os.environ.get('PAI_PROXY_BIND', '0.0.0.0')
     port = int(os.environ.get('PAI_PROXY_PORT', '11435'))
-    server = ThreadingHTTPServer((bind, port), make_handler(token, model=os.environ.get('OLLAMA_MODEL', 'qwen2.5vl:3b')))
+    server = ThreadingHTTPServer((bind, port), make_handler(token, model=os.environ.get('OLLAMA_MODEL', 'qwen3.5:4b-q8_0')))
     print(f'Authenticated local proxy listening on {bind}:{port}; forwarding only to 127.0.0.1:11434.')
     print('Keep this terminal open. Ctrl+C stops the proxy. Use a trusted local network; HTTP is not encrypted.')
     try: server.serve_forever()

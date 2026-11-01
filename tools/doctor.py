@@ -28,7 +28,7 @@ def main():
         with build_opener(ProxyHandler({})).open(req, timeout=10) as response:
             data = json.load(response)
         names = [m.get('name') for m in data.get('models', [])]
-        required = os.environ.get('OLLAMA_MODEL', 'qwen2.5vl:3b')
+        required = os.environ.get('OLLAMA_MODEL', 'qwen3.5:4b-q8_0')
         print('Local models:', names)
         if required not in names:
             raise RuntimeError(f'{required} not installed in host Ollama')

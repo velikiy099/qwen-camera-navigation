@@ -1,228 +1,344 @@
-"""ROS sensor subscriptions, asynchronous VLM, pure brain and Twist publisher.
-
-No Webots API, simulator entity poses, runtime code generation or ROS work from
-worker threads. The robot is commanded to STOP throughout slow VLM inference.
-"""
+"""ROS adapter for the camera-only Qwen agent; all worker results are epoch-scoped."""
 from __future__ import annotations
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import asdict
 from datetime import datetime, timezone
 from pathlib import Path
 import csv
 import json
+import math
 import os
 import time
+import uuid
 
 import rclpy
 from rclpy.node import Node
 from rclpy.clock import Clock, ClockType
 from rclpy.qos import qos_profile_sensor_data
-from sensor_msgs.msg import Image, LaserScan
+from sensor_msgs.msg import Image
+from nav_msgs.msg import Odometry
 from geometry_msgs.msg import Twist
 from std_msgs.msg import String
 from std_srvs.srv import Trigger
 
-from .images import to_bgra, png_from_bgra
-from .vision_tracking import find_target_blob
-from .ranges import Ranges, summarize_scan
-from .behavior import VisualSearchBrain, Command
-from .ollama_client import OllamaClient
+from .agent import CameraAgent, parse_mission
+from .navigation import Goal
+from .images import CHANNELS, png_from_image
+from .ollama_client import InvalidToolResponse, OllamaClient
+from .motion import OdometrySample, ODOM_MAX_AGE, wrap
+from .mission_status import state_line
+
 
 class VisualRobot(Node):
     def __init__(self):
         super().__init__('visual_robot')
-        self.declare_parameter('vision_mode', 'ai')
-        self.declare_parameter('log_dir', os.environ.get('PAI_LOG_DIR', '/workspace/logs'))
-        self.declare_parameter('ai_timeout', 120.0)
-        self.vision_mode = self.get_parameter('vision_mode').value
-        if self.vision_mode not in ('ai', 'rules'):
-            raise ValueError('vision_mode must be ai or rules')
+        defaults = {'log_dir': os.environ.get('PAI_LOG_DIR', '/workspace/logs'),
+                    'ai_timeout': 90.0, 'max_actions': 80,
+                    'max_sim_seconds': 900.0, 'max_wall_seconds': 1200.0}
+        for key, value in defaults.items():
+            self.declare_parameter(key, value)
         self.ai_timeout = float(self.get_parameter('ai_timeout').value)
+        self.max_actions = int(self.get_parameter('max_actions').value)
+        self.max_sim = float(self.get_parameter('max_sim_seconds').value)
+        self.max_wall = float(self.get_parameter('max_wall_seconds').value)
+        if not 1 <= self.max_actions <= 500 or not all(math.isfinite(v) and v > 0 for v in (self.max_sim, self.max_wall)):
+            raise ValueError('Invalid mission budget')
         self.client = OllamaClient(timeout=self.ai_timeout)
         self.pool = ThreadPoolExecutor(max_workers=1, thread_name_prefix='vlm')
         self.pending = None
         self.pending_epoch = 0
         self.pending_started = 0.0
         self.pending_path = ''
-        self.epoch = 0
-        self.counter = 0
-        self.brain = None
+        self.epoch = self.counter = 0
+        self.agent = None
+        self.idle_state, self.idle_reason = 'IDLE', 'Send a natural-language /mission'
         self.image = None
-        self.image_seq = 0
-        self.used_seq = -1
-        self.last_image = self.last_scan = 0.0
-        self.ranges = Ranges.invalid()
-        self.blob = None
-        self.candidate = False
+        self.image_time = None
+        self.last_image = -1e12
+        self.odom = None
+        self.last_odom = -1e12
         self.last_sim = None
-        self.last_clock_advance = time.monotonic()
-        self.last_logged = ''
+        self.last_clock_advance = -1e12
+        self.mission_started = 0.0
+        self.mission_id = None
+        self.last_phase = None
+        self.phase_started = 0.0
+        self.observation = ''
+        self.sensor_ready_once = False
         self.next_log = 0.0
+        self.last_state = ''
         stamp = datetime.now(timezone.utc).strftime('%Y%m%dT%H%M%S_%fZ')
         self.log_dir = Path(self.get_parameter('log_dir').value) / ('run_' + stamp)
         self.log_dir.mkdir(parents=True, exist_ok=False)
         self.csv_handle = (self.log_dir / 'control.csv').open('w', newline='')
         self.csv = csv.writer(self.csv_handle)
-        self.csv.writerow(['wall_time', 'sim_time', 'state', 'target', 'mode', 'desired_v', 'desired_w', 'front_m', 'blob_x', 'reason'])
+        self.csv.writerow(['wall_utc', 'sim_time', 'epoch', 'state', 'step', 'requested_v', 'requested_w', 'reason'])
         self.pub = self.create_publisher(Twist, '/cmd_vel_raw', 10)
         self.status_pub = self.create_publisher(String, '/robot_state', 10)
         self.create_subscription(Image, '/camera/image_raw', self.on_image, qos_profile_sensor_data)
-        self.create_subscription(LaserScan, '/scan', self.on_scan, qos_profile_sensor_data)
+        self.create_subscription(Odometry, '/odom', self.on_odom, qos_profile_sensor_data)
         self.create_subscription(String, '/mission', self.on_mission, 10)
         self.create_service(Trigger, '/halt', self.on_halt)
         self.steady = Clock(clock_type=ClockType.STEADY_TIME)
         self.create_timer(0.05, self.tick, clock=self.steady)
-        self.get_logger().info(f'Ready, vision_mode={self.vision_mode}. Waiting for /mission. Logs: {self.log_dir}')
-        if self.vision_mode == 'rules':
-            self.get_logger().warning('RULES-ONLY DIAGNOSTIC MODE: no image AI; not evidence of AI use')
+        self.get_logger().info(f'Camera agent with wheel-odometry execution ready; model={self.client.model}. Logs: {self.log_dir}')
 
-    def on_image(self, msg):
-        self.image = (bytes(msg.data), msg.width, msg.height, msg.step, msg.encoding)
-        self.image_seq += 1
-        self.last_image = time.monotonic()
-
-    def on_scan(self, msg):
-        self.ranges = summarize_scan(list(msg.ranges), msg.angle_min, msg.angle_increment, msg.range_min, msg.range_max)
-        self.last_scan = time.monotonic()
-
-    def on_mission(self, msg):
-        try:
-            data = json.loads(msg.data)
-            if not isinstance(data, dict) or data.get('target_color') not in ('red', 'blue'):
-                raise ValueError('target_color must be red or blue')
-            self.epoch += 1
-            self.brain = VisualSearchBrain(data['target_color'])
-            self.blob, self.candidate, self.used_seq = None, False, -1
-            self.write_event({'event': 'mission', 'epoch': self.epoch, 'mission': data, 'vision_mode': self.vision_mode})
-            self.get_logger().info(f"New mission: {self.brain.target}. Previous inference cannot authorize this mission.")
-            self.send(Command(state='SEARCH', reason='New mission'))
-        except (ValueError, TypeError) as exc:
-            self.epoch += 1
-            if self.brain:
-                self.brain.fail('Invalid new mission')
-            self.send(Command(state='ERROR', reason=str(exc)))
-            self.get_logger().error(f'Invalid mission: {exc}')
-
-    def on_halt(self, request, response):
-        self.epoch += 1  # invalidate even an already-running worker result
-        if self.brain:
-            self.brain.fail('Operator halt. Send a new mission to restart.')
-        self.send(Command(state='HALTED', reason='Operator halt'))
-        response.success, response.message = True, 'Stopped; pending AI response invalidated'
-        return response
+    def sim_time(self):
+        return self.get_clock().now().nanoseconds / 1e9
 
     def write_event(self, event):
-        event['wall_utc'] = datetime.now(timezone.utc).isoformat()
         with (self.log_dir / 'events.jsonl').open('a', encoding='utf-8') as out:
-            out.write(json.dumps(event, ensure_ascii=False) + '\n')
+            out.write(json.dumps({'wall_utc': datetime.now(timezone.utc).isoformat(),
+                                  'epoch': self.epoch, **event}, ensure_ascii=False, allow_nan=False) + '\n')
+
+    def drain_results(self):
+        if self.agent:
+            for result in self.agent.recent_results:
+                self.write_event({'event': 'tool_result', 'result': result})
+            self.agent.recent_results.clear()
+
+    def fail(self, reason, state='ERROR'):
+        self.epoch += 1  # Includes already-running or already-completed HTTP responses.
+        if self.agent:
+            self.agent.stop(state, reason, self.sim_time())
+            self.drain_results()
+        self.idle_state, self.idle_reason = state, reason
+        self.send(0.0, 0.0)
+        self.write_event({'event': 'stopped', 'state': state, 'reason': reason})
+
+    def on_image(self, msg):
+        try:
+            stamp = msg.header.stamp.sec + msg.header.stamp.nanosec / 1e9
+            if not math.isfinite(stamp) or stamp < 0:
+                raise ValueError('Invalid camera timestamp')
+            if self.image_time is not None and stamp <= self.image_time:
+                return  # A duplicate frame must not refresh the watchdog.
+            channels = CHANNELS.get(msg.encoding, 0)
+            if (not channels or not 0 < msg.width * msg.height <= 4096 * 4096
+                    or msg.width <= 0 or msg.height <= 0 or msg.step < msg.width * channels
+                    or len(msg.data) < msg.step * msg.height):
+                raise ValueError('Invalid camera encoding, dimensions or payload')
+            self.image = (bytes(msg.data), msg.width, msg.height, msg.step, msg.encoding)
+            self.image_time, self.last_image = stamp, time.monotonic()
+        except (ValueError, TypeError, AttributeError) as exc:
+            self.image = None
+            if self.agent and not self.agent.terminal:
+                self.fail(str(exc))
+
+    def on_mission(self, msg):
+        # Stop immediately, including when a replacement mission is invalid.
+        self.pub.publish(Twist())
+        try:
+            instruction = parse_mission(msg.data)
+        except (ValueError, TypeError) as exc:
+            self.fail(f'Invalid mission: {exc}')
+            return
+        if self.agent and not self.agent.terminal:
+            self.agent.stop('HALTED', 'Replaced by a new mission', self.sim_time())
+            self.drain_results()
+        self.epoch += 1
+        self.agent = CameraAgent(instruction, self.sim_time(), max_actions=self.max_actions, max_sim_seconds=self.max_sim)
+        self.mission_id = json.loads(msg.data).get('mission_id') or uuid.uuid4().hex
+        self.observation = ''
+        self.mission_started = time.monotonic()
+        self.sensor_ready_once = False
+        self.write_event({'event': 'mission', 'instruction': instruction, 'model': self.client.model,
+                          'mission_id': self.mission_id,
+                          'inputs': ['RGB camera', 'instruction', 'tool history'],
+                          'robot_control_input': 'wheel_odometry', 'ground_truth_used': False})
+        self.send(0.0, 0.0)
+
+    def on_halt(self, request, response):
+        self.fail('Operator halt; send a new mission to restart', 'HALTED')
+        response.success, response.message = True, 'Stopped; pending model response invalidated'
+        return response
+
+    def on_odom(self, msg):
+        try:
+            sample = OdometrySample.from_message(msg)
+            if self.odom is not None:
+                dt = sample.stamp-self.odom.stamp
+                if dt < 0:
+                    raise ValueError('Wheel odometry clock moved backwards')
+                if dt == 0:
+                    return
+                # Bounds include margin over the SDF velocity limits and sampling noise.
+                if (math.hypot(sample.x-self.odom.x, sample.y-self.odom.y) > 0.2*dt+0.03
+                        or abs(wrap(sample.yaw-self.odom.yaw)) > dt+0.1):
+                    raise ValueError('Wheel odometry jumped; relative motion reference is invalid')
+            self.odom, self.last_odom = sample, time.monotonic()
+        except (ValueError, TypeError, AttributeError) as exc:
+            self.odom, self.last_odom = None, -1e12
+            if self.agent and not self.agent.terminal:
+                self.fail(str(exc))
+
+    def sensors_ready(self, now, sim):
+        return (self.image is not None and self.image_time is not None
+                and 0 <= now - self.last_image <= 1.5
+                and 0 <= sim - self.image_time <= 0.6
+                and self.odom is not None and 0 <= now-self.last_odom <= ODOM_MAX_AGE
+                and 0 <= sim-self.odom.stamp <= ODOM_MAX_AGE
+                and 0 <= now - self.last_clock_advance <= 0.7)
+
+    def poll_response(self, now, sim):
+        if self.pending is None:
+            return
+        if self.pending_epoch == self.epoch and now - self.pending_started > self.ai_timeout + 1:
+            self.fail('VLM response deadline exceeded')
+            return
+        if not self.pending.done():
+            return
+        future, request_epoch, path = self.pending, self.pending_epoch, self.pending_path
+        self.pending = None
+        if request_epoch != self.epoch or not self.agent or self.agent.state != 'THINKING':
+            self.write_event({'event': 'discarded_response', 'request_epoch': request_epoch})
+            return
+        try:
+            action, raw = future.result()
+        except InvalidToolResponse as exc:
+            self.write_event({'event': 'rejected_response', 'camera_path': path, 'raw': exc.raw, 'reason': str(exc)})
+            self.agent.reject(str(exc), sim)
+            self.send(0.0, 0.0)
+            return
+        if isinstance(action, Goal):
+            self.write_event({'event': 'mission_goal', 'raw': raw, 'goal': asdict(action)})
+            self.observation = ''
+        else:
+            self.write_event({'event': 'decision', 'camera_path': path, 'raw': raw, 'tool_call': asdict(action)})
+            self.observation = action.observation
+        self.agent.accept(action, sim)
 
     def tick(self):
-        now = time.monotonic()
-        sim = self.get_clock().now().nanoseconds / 1e9
-        dt = 0.0 if self.last_sim is None else sim - self.last_sim
-        if self.last_sim is not None and dt < -0.01:
-            self.epoch += 1
-            if self.brain:
-                self.brain.fail('Simulation time moved backwards. Send a new mission after resetting.')
-        if dt > 0:
-            self.last_clock_advance = now
-        self.last_sim = sim
-        # Drain the worker only here; the worker never touches ROS or the brain.
-        if self.pending is not None and self.pending.done():
-            try:
-                colors, raw = self.pending.result()
-                valid = self.brain is not None and self.pending_epoch == self.epoch and self.brain.state == 'VERIFY'
-                self.write_event({'event': 'vision', 'image': self.pending_path, 'model': self.client.model,
-                                  'colors': sorted(colors), 'raw': raw, 'accepted_for_current_mission': valid,
-                                  'latency_s': round(now - self.pending_started, 3)})
-                if valid:
-                    self.brain.record_vision(colors)
-            except Exception as exc:
-                if self.brain is not None and self.pending_epoch == self.epoch:
-                    self.brain.fail(f'VLM failed: {exc}')
-                self.write_event({'event': 'vision_error', 'error': str(exc)})
-                self.get_logger().error(f'VLM failed, no success fallback: {exc}')
-            self.pending = None
-        if self.pending is not None and now - self.pending_started > self.ai_timeout + 3:
-            if self.brain and self.pending_epoch == self.epoch:
-                self.brain.fail('VLM deadline exceeded')
-                self.epoch += 1
-        if self.brain is None:
-            self.send(Command(state='IDLE', reason='Send a mission'))
-            return
-        if self.image is None or now - self.last_image > 1.5 or now - self.last_scan > 1.5:
-            self.send(Command(state='WAIT_SENSORS', reason='Fresh camera and lidar required'))
-            return
-        if now - self.last_clock_advance > 0.7 or sim <= 0:
-            self.send(Command(state='WAIT_CLOCK', reason='Simulation paused or /clock missing'))
-            return
-        new_image = self.used_seq != self.image_seq
         try:
-            if new_image:
-                data, width, height, step, encoding = self.image
-                self.bgra = to_bgra(data, width, height, step, encoding)
-                self.used_seq = self.image_seq
-                self.blob = find_target_blob(self.bgra, width, height, self.brain.target)
-                alt = 'blue' if self.brain.target == 'red' else 'red'
-                self.candidate = self.blob is not None or find_target_blob(self.bgra, width, height, alt) is not None
-            action = self.brain.step(self.blob, self.candidate, self.ranges, max(0.0, min(dt, 0.25)), new_image=new_image)
-            if action.request_vision and self.pending is None:
-                self.send(Command(state='VERIFY', reason='Stopped for sensor image inference'))
-                width, height = self.image[1:3]
-                png = png_from_bgra(self.bgra, width, height)
-                self.counter += 1
-                snapshot = self.log_dir / f'camera_{self.counter:04d}.png'
-                snapshot.write_bytes(png)
-                if self.vision_mode == 'rules':
-                    labels = {self.brain.target} if self.blob is not None else set()
-                    self.brain.record_vision(labels)
-                    self.write_event({'event': 'rules_only_confirmation', 'image': snapshot.name, 'ai_used': False})
-                else:
-                    self.pending_epoch, self.pending_path, self.pending_started = self.epoch, snapshot.name, now
-                    self.pending = self.pool.submit(self.client.recognize, png)
-                    self.get_logger().info(f'[VLM] Sent camera {snapshot.name}; motor command stays zero')
-            self.send(action)
+            self._tick()
         except Exception as exc:
-            self.brain.fail(f'Controller error: {exc}')
-            self.send(Command(state='ERROR', reason=str(exc)))
-            self.get_logger().error(str(exc))
+            self.fail(f'{type(exc).__name__}: {exc}')
+            self.get_logger().error(f'Mission stopped: {exc}')
 
-    def send(self, action: Command):
+    def _tick(self):
+        now, sim = time.monotonic(), self.sim_time()
+        previous_sim, self.last_sim = self.last_sim, sim
+        if previous_sim is not None and sim < previous_sim:
+            self.image = self.image_time = None
+            self.odom, self.last_odom = None, -1e12
+            self.last_clock_advance = -1e12
+            if self.agent and not self.agent.terminal:
+                self.fail('Simulation clock reset; send a new mission')
+        elif previous_sim is not None and sim > previous_sim:
+            self.last_clock_advance = now
+        # Reap stale workers without allowing them to affect the new mission.
+        if self.pending is not None and self.pending_epoch != self.epoch and self.pending.done():
+            self.poll_response(now, sim)
+        if not self.agent or self.agent.terminal:
+            self.send(0.0, 0.0)
+            return
+        if now - self.mission_started > self.max_wall:
+            self.fail('Mission wall-time budget exceeded')
+            return
+        if not self.sensors_ready(now, sim):
+            if self.sensor_ready_once or now - self.mission_started > 10:
+                self.fail('Camera, wheel odometry or simulation clock is stale, missing or inconsistent')
+            else:
+                self.send(0.0, 0.0)
+            return
+        self.sensor_ready_once = True
+        # Advance before accepting a response so motion starts at the current clock.
+        v, w = self.agent.advance(sim, self.odom)
+        if self.agent.terminal:
+            self.epoch += 1
+        else:
+            self.poll_response(now, sim)
+            if (self.pending is None and self.agent.ready(sim, self.image_time)
+                    and self.agent.begin_inference()):
+                pixels, width, height, step, encoding = self.image
+                png = png_from_image(pixels, width, height, step, encoding)
+                self.counter += 1
+                path = f'camera_{self.counter:04d}.png'
+                (self.log_dir / path).write_bytes(png)
+                self.agent.observe_frame(png)
+                context = self.agent.context()
+                self.write_event({'event': 'inference_request', 'camera_path': path,
+                                  'image_sim_time': self.image_time, 'context': context})
+                self.pending_epoch, self.pending_started, self.pending_path = self.epoch, now, path
+                self.pending = self.pool.submit(self.client.decide, png, context)
+        self.drain_results()
+        if self.agent.state != 'EXECUTING':
+            v = w = 0.0
+        self.send(v, w)
+
+    def send(self, v, w):
         msg = Twist()
-        msg.linear.x, msg.angular.z = float(action.linear), float(action.angular)
+        msg.linear.x, msg.angular.z = float(v), float(w)
         self.pub.publish(msg)
+        state = self.agent.state if self.agent else self.idle_state
+        reason = self.agent.reason if self.agent else self.idle_reason
         now = time.monotonic()
-        if action.state != self.last_logged or now >= self.next_log:
-            target = self.brain.target if self.brain else ''
-            record = {'state': action.state, 'reason': action.reason, 'target': target, 'vision_mode': self.vision_mode,
-                      'desired_v': action.linear, 'desired_w': action.angular}
-            status = String(); status.data = json.dumps(record)
-            self.status_pub.publish(status)
-            self.csv.writerow([time.time(), self.last_sim, action.state, target, self.vision_mode, action.linear,
-                               action.angular, self.ranges.front, self.blob.center_x_norm if self.blob else '', action.reason])
-            self.csv_handle.flush()
-            if action.state != self.last_logged:
-                self.get_logger().info(f'[{action.state}] {action.reason}')
-            self.last_logged, self.next_log = action.state, now + 0.5
+        step = self.agent.actions if self.agent else 0
+        phase = (self.mission_id, state, step)
+        changed = phase != self.last_phase
+        if changed:
+            self.last_phase, self.phase_started = phase, now
+        if now < self.next_log and not changed:
+            return
+        self.next_log, self.last_state = now + 0.2, state
+        sim = self.sim_time()
+        status = {'state': state, 'reason': reason, 'epoch': self.epoch, 'step': step,
+                  'instruction': self.agent.instruction if self.agent else '', 'model': self.client.model,
+                  'sim_time': sim, 'requested_v': v, 'requested_w': w,
+                  'motion_feedback': 'wheel_odometry', 'ground_truth_used': False, 'arrival_verified': False,
+                  'arrival_reported_by_model': bool(state == 'DONE' and self.agent and self.agent.completion_source == 'model'),
+                  'completion_source': self.agent.completion_source if self.agent else None, 'obstacle_watchdog': False,
+                  'mission_id': self.mission_id, 'observation': self.observation,
+                  'elapsed_wall_s': round(now-self.mission_started, 1) if self.agent else 0,
+                  'state_elapsed_s': round(now-self.phase_started, 1), 'log_dir': str(self.log_dir),
+                  'last_tool_result': ({key: self.agent.history[-1].get(key) for key in ('status', 'reason')}
+                                       if self.agent and self.agent.history else None),
+                  'motion_progress': None}
+        if self.agent:
+            status.update(fixed_goal=asdict(self.agent.goal) if self.agent.goal else None,
+                          candidate_assessment=self.agent.assessment,
+                          search_progress=self.agent.search.context(),
+                          camera_arrival_checks_passed=bool(state == 'DONE' and self.agent.goal and
+                              self.agent.goal.kind == 'approach' and self.agent.assessment.get('confirmed_in_two_frames')))
+        if self.agent and self.agent.motion:
+            motion = self.agent.motion
+            turn = motion.tool == 'turn'
+            status['motion_progress'] = {'tool': motion.tool,
+                'goal': math.degrees(motion.amount) if turn else motion.amount,
+                'current': math.degrees(motion.angle) if turn else motion.distance,
+                'unit': 'deg' if turn else 'm'}
+        if changed:
+            self.get_logger().info(state_line(status))
+            if self.agent and (state in ('DONE', 'STOPPED', 'HALTED', 'ERROR')):
+                self.get_logger().info('Reason: ' + reason)
+        message = String()
+        message.data = json.dumps(status, ensure_ascii=False)
+        self.status_pub.publish(message)
+        self.csv.writerow([datetime.now(timezone.utc).isoformat(), sim, self.epoch, state, step, v, w, reason])
+        self.csv_handle.flush()
 
     def close(self):
-        try:
-            if rclpy.ok():
-                self.send(Command(state='SHUTDOWN', reason='Controller closing'))
-        finally:
-            self.pool.shutdown(wait=False, cancel_futures=True)
-            self.csv_handle.close()
+        self.epoch += 1
+        if rclpy.ok():
+            self.pub.publish(Twist())
+        if self.agent and not self.agent.terminal:
+            self.agent.stop('HALTED', 'Controller shutdown', self.sim_time())
+            self.drain_results()
+        if self.pending is not None:
+            self.pending.cancel()
+        self.pool.shutdown(wait=False, cancel_futures=True)
+        self.csv_handle.close()
+
 
 def main(args=None):
     rclpy.init(args=args)
-    node = None
+    node = VisualRobot()
     try:
-        node = VisualRobot()
         rclpy.spin(node)
     except KeyboardInterrupt:
         pass
     finally:
-        if node is not None:
-            node.close()
-            node.destroy_node()
+        node.close()
+        node.destroy_node()
         if rclpy.ok():
             rclpy.shutdown()
