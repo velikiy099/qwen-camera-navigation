@@ -25,5 +25,13 @@ __pycache__/
 /output/pdf/**/*.pdf
 /output/pdf/node_modules/
 
+# Generated report verification records and unused experiment figures stay local.
+/output/pdf/environment_snapshot.json
+/output/pdf/report_build.json
+/output/pdf/requirements_check.json
+/output/pdf/world_topview_sources.json
+/output/pdf/assets/fig3a_wrong_target.png
+/output/pdf/assets/fig3b_stationary_confirmation.png
+
 # Documentation and experiment artifacts stay local.
 /docs/
